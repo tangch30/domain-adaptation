@@ -1,4 +1,4 @@
-import os, datetime
+import os, datetime, json
 import argparse
 import pandas as pd
 import itertools
@@ -6,19 +6,10 @@ import torch
 import lightning as L
 from lightning.pytorch.loggers import TensorBoardLogger
 from data_loader import MNLIDataModule
-from trainer import seq_pair_classif_training
+from trainer import seq_pair_classif_training, domain_classif_training, collect_domain_model_paths
 
 
-# def init_parser():
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--lr", type=int, help="learning rate")
-#     parser.add_argument("--batch_size", type=int, help="train batch size")
-#     parser.add_argument("--num_train_steps", type=int, help="total number of train steps")
-#     parser.add_argument("--opt_name", type=str, default="AdamW")
-#     parser.add_argument("--domain", type=str, default="government", help="domain to tune on")
-#     parser.add_argument("--task", type=str, default="seq", help="tuning seq-classifier or domain-classifier")
-#     args = parser.parse_args()
-#     return args
+BERT_ALL_FT_PATH=r'C:\Users\tangc\PycharmProjects\domain-adaptation\logs\ALL20250703134849\all\wpr0.01lr4e05ebs32epochs3\checkpoints\best\best-0-0.83.ckpt'
 
 
 def tune_hyperparameters(data_dir, domain, configs):
@@ -33,7 +24,13 @@ def tune_hyperparameters(data_dir, domain, configs):
         try:
             # Create unique logger with descriptive version
             effective_batch_size = 16*config['grad_accum_steps']
-            version = f"warmup_{config['warmup_ratio']}_lr_{config['lr']}_ebs_{effective_batch_size}_steps_{config['num_train_steps']}_opt_{config['opt_name']}"
+            #version = f"warmup_{config['warmup_ratio']}_lr_{config['lr']}_ebs_{effective_batch_size}_freeze_mode_{str(config['freeze_mode'])}_steps_{config['num_train_steps']}_opt_{config['opt_name']}"
+            version = list()
+            for key, value in config.items():
+                version.append(key + "_" + str(value))
+
+            version = "_".join(version)
+
             logger = TensorBoardLogger(
                 save_dir=log_dir,
                 name=domain,
@@ -56,20 +53,24 @@ def tune_hyperparameters(data_dir, domain, configs):
                     "num_train_steps": config["num_train_steps"]
                 },
                 logger=logger,
-                train_ratio=0.05,
-                grad_accum_steps=config['grad_accum_steps']
+                train_ratio=config.get("train_ratio", 0.05),
+                grad_accum_steps=config['grad_accum_steps'],
+                ckpt_path=BERT_ALL_FT_PATH
             )
             # Record results with all metrics
             result = {
                 "trial": i + 1,
-                "warmup_ratio": config["warmup_ratio"],
-                "lr": config["lr"],
+                #"warmup_ratio": config["warmup_ratio"],
+                #"lr": config["lr"],
                 "effective_batch_size": effective_batch_size,
-                "num_train_steps": config["num_train_steps"],
-                "opt_name": config["opt_name"],
+                #"num_train_steps": config["num_train_steps"],
+                #"opt_name": config["opt_name"],
                 "version": version,
                 **val_metrics  # Include all validation metrics
             }
+
+            for key, value in config.items():
+                result[key] = value
             results.append(result)
 
             # Save incremental results
@@ -156,31 +157,136 @@ if __name__ == '__main__':
                         default=r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets')
     parser.add_argument("--domain", required=True, help="Target domain for tuning")
     parser.add_argument("--port", type=int, default=6006, help="TensorBoard port")
+    parser.add_argument("--task", choices=["seq_pair_classif", "domain_classif"],  # New argument
+                        default="seq_pair_classif",
+                        help="Task to tune")
+    parser.add_argument("--domain_models_dir", type=str,  # New argument
+                        help="Directory with domain models (required for domain_classif)")
     args = parser.parse_args()
 
-    # Define hyperparameter search space
-    search_space = {
-        "lr": [2e-5, 3e-5, 4e-5, 5e-5],  # Learning rates
-        "grad_accum_steps": [2],  # Batch sizes
-        "warmup_ratio": [0.01, 0.1],
-        "num_train_steps": [500],  # Training steps
-        "opt_name": ["AdamW"]  # Optimizers
-    }
+    if args.task == "domain_classif":
+        # Define search space for domain classifier hyperparameters
+        search_space = {
+            "lr": [1e-3, 1e-4, 1e-5, 1e-6],  # Learning rate for domain classifier
+            "mu": [0.0],  # Regularization strength
+            "grad_accum_steps": [2],
+            "batch_size": [16],
+            "num_train_steps": [500],
+            "train_ratio": [0.05, 0.2]
+        }
 
-    # Generate all combinations
-    configs = [dict(zip(search_space.keys(), values))
-               for values in itertools.product(*search_space.values())]
+        # Generate all combinations of hyperparameters
+        configs = [dict(zip(search_space.keys(), values))
+                   for values in itertools.product(*search_space.values())]
 
-    print(f"Starting hyperparameter tuning for domain: {args.domain}")
-    print(f"Testing {len(configs)} configurations...")
+        print(f"Starting hyperparameter tuning for domain classifier")
+        print(f"Testing {len(configs)} configurations...")
 
-    # Run tuning and get log directory
-    log_dir = tune_hyperparameters(
-        data_dir=args.data_dir,
-        domain=args.domain,
-        configs=configs
-    )
+        # Create results directory
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"logs/domain_classif_tuning_{timestamp}"
+        os.makedirs(log_dir, exist_ok=True)
+        results_file = os.path.join(log_dir, f"domain_classif_results.csv")
 
-    # Start TensorBoard automatically
-    #start_tensorboard(log_dir, port=args.port)
+        results = []
+        for i, config in enumerate(configs):
+            print(f"\n=== Trial {i + 1}/{len(configs)}: {config} ===")
+
+            try:
+                # Create unique logger
+                version = "_".join([f"{k}_{v}" for k, v in config.items()])
+                logger = TensorBoardLogger(
+                    save_dir=log_dir,
+                    name="domain_classif",
+                    version=version,
+                    default_hp_metric=False
+                )
+
+                # Collect domain model paths
+                domains = args.domain.split("-")
+                domain_model_paths = collect_domain_model_paths(
+                    domains, args.domain_models_dir
+                )
+
+                optimizer_config = {
+                    "lr": config["lr"],
+                    "mu": config["mu"]
+                }
+
+                train_params = {
+                    "batch_size": config["batch_size"],
+                    "num_train_steps": config["num_train_steps"]
+                }
+
+                if "num_train_epochs" in config:
+                    train_params['num_train_epochs'] = config["num_train_epochs"]
+                    optimizer_config["epochs"] = config["num_train_epochs"]
+
+                # Run domain classifier training
+                val_metrics = domain_classif_training(
+                    data_dir=args.data_dir,
+                    domains=domains,
+                    optimizer_config=optimizer_config,
+                    train_params=train_params,
+                    domain_model_paths=domain_model_paths,
+                    logger=logger,
+                    train_ratio=config["train_ratio"],
+                    grad_accum_steps=config["grad_accum_steps"]
+                )
+
+                # Record results
+                result = {
+                    "trial": i + 1,
+                    **config,
+                    **val_metrics
+                }
+                results.append(result)
+
+                # Save incremental results
+                df = pd.DataFrame(results)
+                df.to_csv(results_file, index=False)
+                print(f"Trial complete | Val Acc: {val_metrics.get('val_acc', 'N/A'):.4f}")
+
+            except Exception as e:
+                print(f"Trial failed: {str(e)}")
+                results.append({
+                    "trial": i + 1,
+                    "error": str(e),
+                    **config
+                })
+
+        # Find best configuration
+        successful_runs = [r for r in results if 'val_acc' in r]
+        if successful_runs:
+            best_run = max(successful_runs, key=lambda x: x['val_acc'])
+            print(f"\nBest configuration: acc={best_run['val_acc']:.4f}")
+            print(f"Parameters: lr={best_run['lr']}, mu={best_run['mu']}, "
+                  f"batch_size={best_run['batch_size']}, epochs={best_run['num_train_steps']}")
+
+            # Save best config
+            with open(os.path.join(log_dir, "best_config.txt"), "w") as f:
+                f.write(str(best_run))
+
+    else:  # Original sequence classification tuning
+        search_space = {
+            "lr": [2e-6, 4e-6, 1e-5, 4e-5],
+            "grad_accum_steps": [2],
+            "warmup_ratio": [0.01],
+            "freeze_mode": [None, "freeze_bert", "freeze_classifier"],
+            "num_train_steps": [1500],
+            "train_ratio": [0.05, 0.01, 0.2],
+            "opt_name": ["AdamW"]
+        }
+
+        configs = [dict(zip(search_space.keys(), values))
+                   for values in itertools.product(*search_space.values())]
+
+        print(f"Starting hyperparameter tuning for domain: {args.domain}")
+        print(f"Testing {len(configs)} configurations...")
+
+        log_dir = tune_hyperparameters(
+            data_dir=args.data_dir,
+            domain=args.domain,
+            configs=configs
+        )
 

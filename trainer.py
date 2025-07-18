@@ -1,52 +1,231 @@
-"""Train domain-wise predictor and task predictor"""
+"""Train domain classifier and task predictor"""
 ## DeepSeek is used during coding
-
-# input: data loader (domain name), pre-trained bert
-# save fine-tuned bert
-# should i install HF-transformer locally
-# load bert-model from HF-transformer github
 
 import lightning as L
 import torch
 import argparse, os, json
-import random
+import torch.nn.functional as F
 from datetime import datetime
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.tensorboard import SummaryWriter
 
-from transformers import AutoModel, AutoModelForSequenceClassification
+from transformers import AutoConfig, BertForSequenceClassification, AutoModelForSequenceClassification
 from transformers import BertModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 from data_loader import MNLIDataModule, mnli_preprocess
 
 #TODO: Change validation metric, check log frequency (you haven't written any data to event files -tfb)
+BERT_BASE_DIR=r'C:\Users\tangc\PycharmProjects\domain-adaptation\bert-base-uncased-cache'
+
+
+def collect_domain_model_paths(domains, domain_models_dir):
+    """
+    Collect model checkpoint paths for given domains from a directory.
+
+    Args:
+        domains: List of domain names
+        domain_models_dir: Directory containing model checkpoints
+
+    Returns:
+        List of paths to model checkpoints in the same order as domains
+    """
+    domain_model_paths = []
+    domain_files = {}
+
+    print(f"Searching in directory: {domain_models_dir}")
+    print(f"Directory exists? {os.path.exists(domain_models_dir)}")
+    print(f"Files in directory: {os.listdir(domain_models_dir)}")
+
+    # Collect all checkpoint files in directory
+    for root, _, files in os.walk(domain_models_dir):
+        print(root)
+        print(files)
+        for file in files:
+            if file.endswith(".ckpt"):
+                full_path = os.path.join(root, file)
+                # Try to find matching domain in filename
+                for domain in domains:
+                    if domain.lower() in file.lower():
+                        domain_files[domain] = full_path
+                        break
+
+    # Create ordered list based on input domains
+    for domain in domains:
+        if domain in domain_files:
+            domain_model_paths.append(domain_files[domain])
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found for domain '{domain}' in {domain_models_dir}. "
+                "Filenames should contain domain names."
+            )
+
+    print(f"Loaded domain models:")
+    for domain, path in zip(domains, domain_model_paths):
+        print(f"  {domain}: {path}")
+
+    return domain_model_paths
+
+
+# def load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3):
+#     model = AutoModelForSequenceClassification.from_pretrained(
+#         pretrained_model_name_or_path=pretrained_path,
+#         num_labels=num_labels
+#     )
+#     # Load checkpoint
+#     checkpoint = torch.load(ckpt_path, map_location='cpu')
+#     # Extract state dict
+#     state_dict = checkpoint['state_dict']
+#     for key in state_dict.keys():
+#         print(key)
+#     state_dict = {k.replace('model.', ''): v
+#                   for k, v in state_dict.items()
+#                   if k.startswith('model.')
+#                   }
+#
+#     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+#     print(f"Missing keys: {missing}")
+#     print(f"Unexpected keys: {unexpected}")
+#     return model
+
+
+# Update the load_model function to handle different checkpoint formats
+def load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3):
+    model = AutoModelForSequenceClassification.from_pretrained(
+        pretrained_model_name_or_path=pretrained_path,
+        num_labels=num_labels
+    )
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    state_dict = checkpoint['state_dict']
+
+    # Remove all prefixes from keys (model., domain_models.domain.)
+    new_state_dict = {}
+    for key in list(state_dict.keys()):
+        # Handle shared model prefix (model.)
+        if key.startswith('model.'):
+            new_key = key.replace('model.', '', 1)
+        # Handle domain-specific prefix (domain_models.domain_name.)
+        elif key.startswith('domain_models.'):
+            parts = key.split('.')
+            # Keep only keys after the domain name
+            new_key = '.'.join(parts[2:])
+        else:
+            new_key = key
+
+        # Only keep keys that exist in the model
+        if any(new_key.startswith(prefix) for prefix in ['bert', 'classifier', 'dropout', 'fc']):
+            new_state_dict[new_key] = state_dict[key]
+
+    # Load filtered state dict
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+    print(f"Successfully loaded keys: {list(new_state_dict.keys())}")
+    print(f"Missing keys: {missing}")
+    print(f"Unexpected keys: {unexpected}")
+    return model
 
 
 class LightBERTSeqClass(L.LightningModule):
-    def __init__(self, domains, optimizer_config=None, shared_model=False):
+    def __init__(self, domains, optimizer_config=None, shared_model=False, ckpt_path=None,
+                 freeze_mode=None):
         super().__init__()
         self.optimizer_config = optimizer_config
         self.shared_model = shared_model  # New flag for shared model
+        self.freeze_mode = freeze_mode
+        pretrained_path = None
+        if ckpt_path is None:
+            pretrained_path = BERT_BASE_DIR
+
 
         if shared_model:
             # Single shared model for all domains
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                r'C:\Users\tangc\PycharmProjects\domain-adaptation\bert-base-uncased-cache',
-                num_labels=3
-            )
+            if pretrained_path is not None:
+                # load from pretrained
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_path,
+                    num_labels=3
+                )
+            else:
+                # load from checkpoint
+                assert ckpt_path is not None
+                self.model = load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3)
+            self._apply_freeze_mode(self.model)
         else:
             # Separate models per domain (original behavior)
             self.domain_models = torch.nn.ModuleDict()
             for domain in domains:
-                model = AutoModelForSequenceClassification.from_pretrained(
-                    r'C:\Users\tangc\PycharmProjects\domain-adaptation\bert-base-uncased-cache',
-                    num_labels=3
-                )
+                if pretrained_path is not None:
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        pretrained_model_name_or_path=pretrained_path,
+                        num_labels=3
+                    )
+                else:
+                    assert ckpt_path is not None
+                    model = load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3)
+                self._apply_freeze_mode(model)
                 self.domain_models[domain] = model
 
         self.curr_domain = None
+        self.print_trainable_params()
+
+
+    def _apply_freeze_mode(self, model):
+        """Apply freezing based on selected mode"""
+        if self.freeze_mode is None:
+            return  # No freezing, all parameters trainable
+
+        if self.freeze_mode == "freeze_bert":
+            # Freeze all parameters first
+            for param in model.parameters():
+                param.requires_grad = False
+
+            # Unfreeze classifier layers
+            classifier_layers = [
+                'classifier', 'cls', 'fc', 'out_proj', 'qa_outputs'
+            ]
+
+            for name, param in model.named_parameters():
+                if any(layer in name for layer in classifier_layers):
+                    param.requires_grad = True
+                    print(f"Unfreezing classifier layer: {name}")
+
+        elif self.freeze_mode == "freeze_classifier":
+            # Freeze classifier layers
+            classifier_layers = [
+                'classifier', 'cls', 'fc', 'out_proj', 'qa_outputs'
+            ]
+
+            for name, param in model.named_parameters():
+                if any(layer in name for layer in classifier_layers):
+                    param.requires_grad = False
+                    print(f"Freezing classifier layer: {name}")
+
+
+    def print_trainable_params(self):
+        """Print trainable parameters count and names"""
+        if self.shared_model:
+            model = self.model
+        else:
+            # Use the first domain model
+            model = self.domain_models[list(self.domain_models.keys())[0]]
+
+        total_params = 0
+        trainable_params = 0
+        trainable_names = []
+
+        for name, param in model.named_parameters():
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                trainable_names.append(name)
+
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,} ({trainable_params / total_params:.2%})")
+        print("Trainable layers:")
+        for name in trainable_names[:10]:  # Show first 10 for brevity
+            print(f"  - {name}")
+        if len(trainable_names) > 10:
+            print(f"  ... and {len(trainable_names) - 10} more layers")
 
 
     def reset_domain(self, domain):
@@ -73,47 +252,6 @@ class LightBERTSeqClass(L.LightningModule):
             inputs['labels'] = batch['labels']
 
         return model(**inputs)
-
-
-    # def forward(self, batch, return_dict=True):
-    #     #input_ids, attention_mask, token_type_ids, target = inputs
-    #     #inputs, target = batch
-    #     #input_ids, attention_mask, token_type_ids = inputs
-    #     input_ids = batch['input_ids']
-    #     attention_mask = batch['attention_mask']
-    #     token_type_ids = batch['token_type_ids']
-    #     labels = batch['labels']
-    #     #print("Input_ids: ", input_ids)
-    #     #return self.seq_classifiers[self.curr_domain](input_ids, attention_mask,
-    #     #                                              token_type_ids, labels=labels,
-    #     #                                              return_dict=return_dict)
-    #     # Pass through shared base model
-    #     outputs = self.base_model(
-    #         input_ids=input_ids,
-    #         attention_mask=attention_mask,
-    #           token_type_ids=token_type_ids,
-    #         return_dict=return_dict
-    #     )
-    #
-    #     # Get pooled output (CLS token representation)
-    #     pooled_output = outputs.pooler_output
-    #
-    #     # Pass through domain-specific classifier head
-    #     logits = self.classifier_heads[self.curr_domain](pooled_output)
-    #
-    #     # Calculate loss
-    #     loss_fct = torch.nn.CrossEntropyLoss()
-    #     loss = loss_fct(logits.view(-1, 3), labels.view(-1))
-    #
-    #     # Return in standard Hugging Face output format
-    #     if return_dict:
-    #         return SequenceClassifierOutput(
-    #             loss=loss,
-    #             logits=logits,
-    #             hidden_states=outputs.hidden_states,
-    #             attentions=outputs.attentions
-    #         )
-    #     return (loss, logits)
 
 
     def training_step(self, batch, batch_idx):
@@ -238,115 +376,146 @@ class LightBERTSeqClass(L.LightningModule):
         }
 
 
-class LightBERTDomainClass(L.LightningModule):
-    def __init__(self, domains):
+class LightDomainClassifier(L.LightningModule):
+    def __init__(self, domain_model_paths, optimizer_config=None):
         super().__init__()
-        self.domain_dict = dict()
-        for idx, domain in enumerate(domains):
-            self.domain_dict[domain] = idx
-        self.domain_classifiers = dict()
-        for domain in domains:
-            self.domain_classifiers[domain] = AutoModelForSequenceClassification.from_pretrained(r'C:\Users\tangc\PycharmProjects\domain-adaptation\bert-base-uncased-cache')
+        self.optimizer_config = optimizer_config
+        self.mu = optimizer_config["mu"]
 
-    def reset_domain(self, domain):
-        self.curr_domain = domain
+        # Load domain-specific BERT models and freeze them
+        self.domain_models = torch.nn.ModuleList()
+        for path in domain_model_paths:
+            model = load_model(path)
+            model.requires_grad_(False)  # Freeze all parameters
+            self.domain_models.append(model)
 
-    def forward(self, inputs, targets):
-        #TODO: inputs, target <--- batch suggested by DeepSeek
-        input_ids, attention_mask, token_type_ids = inputs
-        return self.domain_classifiers[self.curr_domain](input_ids, attention_mask,
-                                                      token_type_ids, labels=targets)
+        # Get hidden size from first model
+        hidden_size = self.domain_models[0].config.hidden_size
 
-    def training_step(self, batch_dict, batch_idx):
-        # The dataloader will load a batch for each domain
-        # extend batch: determine one domain and sample from any of other domains
-        # randomly shuffle postive and negative domain examples
-        #outputs = self(batch) #TODO ?
-        #loss = outputs.loss #TODO: check
-        this_batch = batch_dict[self.curr_domain]
-        other_domain = None
-        rint = random.randint(1, len(self.domain_classifiers.keys()))
-        count = 1
-        for domain in self.domain_classifiers.keys():
-            if domain == self.curr_domain:
-                continue
-            if count == rint:
-                other_domain = domain
-                break
-            count += 1
-        assert other_domain is not None and other_domain != self.curr_domain
-        other_batch = batch_dict[other_domain]
-        this_target = torch.tensor([self.domain_dict[self.curr_domain]] * len(this_batch))
-        other_target = torch.tensor([self.domain_dict[other_domain]] * len(other_batch))
-        batch = torch.cat([this_batch, other_batch], axis=0)
-        batch_y = torch.cat([this_target, other_target], axis=0)
-        idx = torch.randperm(len(batch))
-        batch = batch[idx, :]
-        batch_y = batch_y[idx, :]
-        outputs = self(batch, batch_y)
-        loss = outputs.loss
-        return loss
+        # Initialize SINGLE weight vector (hidden_size)
+        self.w = torch.nn.Parameter(torch.randn(hidden_size))
+
+
+    def forward(self, batch, return_dict=True):
+        # Collect features from all domain-specific models
+        domain_features = []
+        inputs = {
+            'input_ids': batch['input_ids'],
+            'attention_mask': batch['attention_mask'],
+            'token_type_ids': batch['token_type_ids'],
+            'return_dict': return_dict
+        }
+        for model in self.domain_models:
+            # TODO: model.bert may not be compatible with all models
+            outputs = model.bert(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                token_type_ids=inputs["token_type_ids"],
+                return_dict=True
+            )
+            # Use pooled output (CLS token representation)
+            pooled_output = outputs.pooler_output
+            domain_features.append(pooled_output)
+
+        # Stack features: (batch_size, num_domains, hidden_size)
+        features = torch.stack(domain_features, dim=1)
+
+        # Compute logits: w^T * f(x, k) for each domain k
+        logits = torch.einsum('h,bkh->bk', self.w, features)
+        return logits
+
+    def training_step(self, batch, batch_idx):
+        logits = self(batch)
+
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, batch['labels'])
+
+        # L2 regularization: μ||w||^2
+        reg_loss = self.mu * torch.sum(self.w ** 2)
+
+        total_loss = loss + reg_loss
+        self.log("train_loss", total_loss, prog_bar=True)
+        return total_loss
+
+
+    def validation_step(self, batch, batch_idx):
+        logits = self(batch)
+        loss = F.cross_entropy(logits, batch['labels'])
+        reg_loss = self.mu * torch.sum(self.w ** 2)
+        total_loss = loss + reg_loss
+
+        preds = torch.argmax(logits, dim=1)
+        acc = (preds == batch['labels']).float().mean()
+
+        self.log("val_loss", total_loss, prog_bar=True)
+        self.log("val_acc", acc, prog_bar=True)
+        return total_loss
 
 
     def configure_optimizers(self):
-        return torch.optim.SGD(self.domain_classifiers[self.curr_domain].parameters(), lr=0.1) #TODO: configure optimizer
+        optimizer = torch.optim.AdamW(
+            [self.w],
+            #lr=lr,
+            weight_decay=0.01,
+            eps=1e-6,
+        )
 
+        lr = self.optimizer_config.get('lr', 2e-5)
+        total_steps = self.optimizer_config.get('total_steps', None)
+        epochs = self.optimizer_config.get("epochs", None)
+        warmup_ratio = self.optimizer_config.get('warmup_ratio', 0.01)
+        #epochs = self.optimizer_config.get('num_train_epochs', None)
+        #steps_per_epoch = self.optimizer_config.get('steps_per_epoch', None)
 
-class BaseLearner(object):
-    def __init__(self, data_dir, domains, sentiments,
-                 seq_classif_params=None,
-                 domain_classif_params=None):
-        self.data_dir = data_dir
-        self.domains = domains
-        #self.sentiments = sentiments
-        self.seq_classif_params = seq_classif_params
+        if total_steps is None and hasattr(self, 'trainer') and self.trainer is not None:
+            #TODO: need extra debugging
+            total_steps = self.trainer.estimated_stepping_batches
 
-        #self.domain_pl = None
-        self.task_pl = LightBERTSeqClass(domains)
-        #self.domain_predictors = None # TODO
-        #self.task_predictors = None # TODO: get the automodel after training
+        assert total_steps is not None, "Total number of steps cannot be determined!"
 
-        self.dm = MNLIDataModule(data_dir, domains, sentiments)
-        self.dm.prepare_data()
+        assert total_steps is not None
+        print(f"Total train steps: {total_steps}")
 
+        steps_per_epoch = None
+        if epochs is not None:
+            assert total_steps % epochs == 0
+            steps_per_epoch = total_steps // epochs
 
-    def seq_pair_classif_training(self, domain, logger):
-        train_params = self.seq_classif_params[domain]
-        batch_size, max_epochs = train_params['batch_size'], train_params['max_epochs']
-        self.dm.reset_batch_size(batch_size)
-        self.dm.setup('fit', 'seq_pair_classif', domain)
-        self.task_pl.reset_domain(domain)
-        trainer = L.Trainer(
-            logger=logger,
-            #accelerator="gpu",  # Explicitly use GPU
-            #devices=1,  # Use first available GPU
-            #strategy="auto",  # Automatically select best strategy
-            #precision="16-true",  # Mixed precision for efficiency
-            gradient_clip_val=1.0,  # Prevent exploding gradients
-            max_epochs=max_epochs,  # Prevent infinite training
-            enable_progress_bar=True,
-            log_every_n_steps=100,
-            #detect_anomaly=True  # Helpful for debugging
-        ) # TODO readthedoc: args and where is model kept
-        trainer.fit(self.task_pl, self.dm.train_dataloader(), self.dm.val_dataloader())
+        print(f"Epochs {epochs} | Steps per epoch {steps_per_epoch}")
 
+        if steps_per_epoch is not None:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=lr,  # Peak learning rate
+                total_steps=total_steps,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=warmup_ratio,
+                anneal_strategy='linear'
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=lr,  # Peak learning rate
+                total_steps=total_steps,
+                pct_start=warmup_ratio,
+                anneal_strategy='linear'
+            )
 
-    #def seq_pair_classif_predict(self):
-    #    pass
-
-    def domain_training(self, domain):
-        # at each step load a pair of data from domain A and not domain A
-        pass
-
-    def clean_up(self):
-        # also remove tmp files
-        pass
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
 
 
 # Modified training function to return final validation metrics
 def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
                               logger=None, train_ratio=0.05, val_ratio=0.3,
-                              grad_accum_steps=1
+                              grad_accum_steps=1, ckpt_path=None, freeze_mode=None,
                               ):
     # train a single model
     batch_size, max_steps = train_params['batch_size'], train_params['num_train_steps']
@@ -359,8 +528,11 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
     task_pl = LightBERTSeqClass(
         domains,
         optimizer_config=optimizer_config,
-        shared_model=shared_model
+        shared_model=shared_model,
+        ckpt_path=ckpt_path,
+        freeze_mode=freeze_mode
     )
+
 
     # Rest of the function remains unchanged
     dm = MNLIDataModule(data_dir, domains,
@@ -373,7 +545,7 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
         dm.setup('fit', 'seq_pair_classif', "all")
     else:
         dm.setup('fit', 'seq_pair_classif', domains[0])
-        task_pl.reset_domain(domain)
+        task_pl.reset_domain(domains[0])
 
     # Create checkpoint directory
     checkpoint_dir = os.path.join(logger.log_dir, "checkpoints")
@@ -391,6 +563,7 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
     )
     if max_epochs == -1:
         trainer = L.Trainer(
+            accelerator="auto",
             logger=logger,
             gradient_clip_val=1.0,
             accumulate_grad_batches=grad_accum_steps,
@@ -398,13 +571,14 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
             limit_val_batches=val_ratio,
             max_steps=max_steps,
             enable_progress_bar=True,
-            log_every_n_steps=100,
+            log_every_n_steps=100, #TODO
             callbacks=[checkpoint_callback]
             #callbacks=[L.pytorch.callbacks.ModelCheckpoint(monitor='val_acc', mode='max')]
         )
     else:
         # epoch-based training is the priority
         trainer = L.Trainer(
+            accelerator="auto",
             logger=logger,
             gradient_clip_val=1.0,
             accumulate_grad_batches=grad_accum_steps,
@@ -412,7 +586,7 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
             limit_val_batches=val_ratio,
             max_epochs=max_epochs,
             enable_progress_bar=True,
-            log_every_n_steps=100,
+            log_every_n_steps=100, #TODO
             callbacks=[checkpoint_callback]
         )
 
@@ -426,7 +600,9 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
             "grad_accum_steps": grad_accum_steps,
             "num_train_steps": max_steps,
             "opt_name": optimizer_config.get('opt_name', 'AdamW'),
-            "domain": "-".join(domains)
+            "domain": "-".join(domains),
+            "ckpt_path": ckpt_path,
+            "freeze_mode": freeze_mode
         })
 
     trainer.fit(task_pl, dm.train_dataloader(), dm.val_dataloader())
@@ -443,52 +619,133 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
     return val_metrics
 
 
-######## call after training...from DeepSeek
-"""
-import json
-from datetime import datetime
+def domain_classif_training(data_dir, domains, optimizer_config, train_params,
+                            domain_model_paths, logger=None, train_ratio=0.05,
+                            val_ratio=0.3, grad_accum_steps=1):
+    """
+    TODO: test code sanity and tuner
+    Train a domain classifier using pre-trained domain-specific models
 
+    Args:
+        domain_model_paths: List of paths to pre-trained domain-specific models
+        Other args same as seq_pair_classif_training
+    """
+    batch_size, max_steps = train_params['batch_size'], train_params['num_train_steps']
+    max_epochs = train_params.get('num_train_epochs', -1)
 
-def save_metadata_for_reproducibility(config, metrics):
-    # for code reproducibility
-    repo = git.Repo(search_parent_directories=True)
+    # Create domain classifier model
+    domain_classifier = LightDomainClassifier(
+        domain_model_paths=domain_model_paths,
+        optimizer_config=optimizer_config
+    )
 
-    meta = {
-        "timestamp": datetime.now().isoformat(),
-        "git": {
-            "commit": repo.head.commit.hexsha,
-            "branch": repo.active_branch.name,
-            "dirty": repo.is_dirty()
-        },
-        "environment": {
-            "platform": platform.platform(),
-            "python": platform.python_version(),
-            "libraries": {
-                "torch": torch.__version__,
-                "transformers": transformers.__version__
-            }
-        },
-        "config": vars(config) if hasattr(config, '__dict__') else config,
-        "metrics": metrics
-    }
+    # Setup data module for domain classification
+    dm = MNLIDataModule(data_dir, domains, ['entailment', 'contradiction', 'neutral'])
+    dm.prepare_data()
+    dm.reset_batch_size(batch_size)
+    dm.setup('fit', 'domain_classif', "all")  # Use all domains for domain classification
 
-    os.makedirs(config.output_dir, exist_ok=True)
-    with open(f"{config.output_dir}/run_meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
-"""
+    # Create checkpoint directory
+    checkpoint_dir = os.path.join(logger.log_dir, "checkpoints") if logger else "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Create checkpoint callback
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        monitor='val_acc',  # Metric to monitor
+        mode='max',  # Maximize validation accuracy
+        save_top_k=1,  # Save only the best model
+        filename='domain_classif-best-{epoch}-{val_acc:.2f}',
+        save_last=True,  # Also save last checkpoint
+        auto_insert_metric_name=False
+    )
+
+    # Configure trainer
+    if max_epochs == -1:
+
+        trainer = L.Trainer(
+            accelerator="auto",
+            logger=logger,
+            gradient_clip_val=1.0,
+            accumulate_grad_batches=grad_accum_steps,
+            limit_train_batches=train_ratio,
+            limit_val_batches=val_ratio,
+            max_steps=max_steps,
+            enable_progress_bar=True,
+            log_every_n_steps=20,  # TODO
+            callbacks=[checkpoint_callback]
+            # callbacks=[L.pytorch.callbacks.ModelCheckpoint(monitor='val_acc', mode='max')]
+        )
+
+    else:
+        trainer = L.Trainer(
+            accelerator="auto",
+            logger=logger,
+            gradient_clip_val=1.0,
+            accumulate_grad_batches=grad_accum_steps,
+            limit_train_batches=train_ratio,
+            limit_val_batches=val_ratio,
+            max_epochs=max_epochs,
+            enable_progress_bar=True,
+            log_every_n_steps=100,
+            callbacks=[checkpoint_callback]
+        )
+
+    # Add hyperparameters to TensorBoard
+    if logger:
+        logger.log_hyperparams({
+            "lr": optimizer_config.get('lr', 1e-3),
+            "batch_size": batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "num_domains": len(domains),
+            "mu": optimizer_config.get('mu', 0)  # Regularization strength
+        })
+
+    # Print out a sample batch
+    sample_batch = next(iter(dm.train_dataloader()))
+    print("Sample batch keys:", sample_batch.keys())
+    print("Input IDs shape:", sample_batch['input_ids'].shape)
+    print("Labels:", sample_batch['labels'][:10])
+
+    # Train the model
+    trainer.fit(domain_classifier, dm.train_dataloader(), dm.val_dataloader())
+
+    # Return final validation metrics
+    val_metrics = trainer.validate(domain_classifier, dataloaders=dm.val_dataloader())
+
+    # After training, get best model path
+    best_model_path = checkpoint_callback.best_model_path
+
+    # Return metrics AND best model path
+    val_metrics = val_metrics[0] if val_metrics else {}
+    val_metrics['best_model_path'] = best_model_path
+    return val_metrics
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", required=False, type=str, default="seq_pair_classif")
     parser.add_argument("--data_dir", required=False,
                         help="Path to dataset directory",
                         default=r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets')
+    parser.add_argument("--domain_models_dir", type=str, default=None,
+                        help="Directory containing trained domain-specific models")
+    parser.add_argument("--ckpt_path", type=str, default=None,
+                        help="Path to checkpoint directory")
+    parser.add_argument("--freeze_mode", type=str, default=None,
+                        choices=["freeze_bert", "freeze_classifier"],
+                        help="Freezing mode: none, freeze_bert, or freeze_classifier")
     parser.add_argument("--domain", type=str, required=True, help="Target domain for tuning")
     parser.add_argument("--port", type=int, default=6006, help="TensorBoard port")
     parser.add_argument("--warmup_ratio", type=float, default=0.06, help="Warmup ratio")
     parser.add_argument("--lr", type=float, required=True, help="Learning rate")
+    parser.add_argument("--mu", type=float, required=False,
+                        default=0.0,
+                        help="regularization hp for domain classification")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--grad_accum_steps", type=int, default=1,
                         help="Number of gradient accumulation steps")
+    parser.add_argument("--train_ratio", type=float, default=1.0)
     parser.add_argument("--num_train_steps", type=int, default=200)
     parser.add_argument("--num_train_epochs", type=int)
 
@@ -527,25 +784,49 @@ if __name__ == '__main__':
         train_params['num_train_epochs'] = args.num_train_epochs
         optimizer_config["epochs"] = args.num_train_epochs
 
+    if args.task == "seq_pair_classif":
+        val_metrics = seq_pair_classif_training(
+            data_dir=data_dir,
+            domains=domain,
+            optimizer_config=optimizer_config,
+            train_params=train_params,
+            logger=logger,
+            train_ratio=args.train_ratio,
+            val_ratio=1.0,
+            grad_accum_steps=args.grad_accum_steps,
+            ckpt_path=args.ckpt_path,
+            freeze_mode=args.freeze_mode,
+        )
 
-    val_metrics = seq_pair_classif_training(
-        data_dir=data_dir,
-        domains=domain,
-        optimizer_config=optimizer_config,
-        train_params=train_params,
-        logger=logger,
-        train_ratio=1.0,
-        val_ratio=1.0,
-        grad_accum_steps=args.grad_accum_steps
-    )
+    else:
+        # get all model address from given folder
+        # TODO： add tests
+        domain_model_paths = collect_domain_model_paths(domain, args.domain_models_dir)
+        val_metrics = domain_classif_training(
+            data_dir,
+            domain,
+            optimizer_config,
+            train_params,
+            domain_model_paths,
+            logger=logger,
+            train_ratio=args.train_ratio,
+            val_ratio=1.0,
+            grad_accum_steps=args.grad_accum_steps
+        )
+
 
     result = {
+        "task": args.task,
         "lr": args.lr,
+        "mu": args.mu,
         "grad_accum_steps": args.grad_accum_steps,
         "batch_size": args.batch_size,
+        "train_ratio": args.train_ratio,
         "num_train_steps": args.num_train_steps,
         "num_train_epochs": args.num_train_epochs,
         "version": version,
+        "ckpt_path": args.ckpt_path,
+        "freeze_mode": args.freeze_mode,
         **val_metrics  # Include all validation metrics
     }
 

@@ -97,9 +97,40 @@ class MNLIDataModule(pl.LightningDataModule):
                 )
                 print(f'Setup stage {stage} | predict size {len(self.predict)}')
 
+
         elif task == 'domain_classif':
-            pass
-            # ... (existing domain classification setup) ...
+            # Combine data from all domains
+            if stage == 'fit':  # Training + Validation
+                # Training set combines all domains
+                self.train = MNLIDataset(
+                    self.data_dir, target_domains, self.domain_dict,
+                    self.sentiment_dict, 'train', task
+                )
+                # Validation set combines dev splits
+                self.valid = ConcatDataset([
+                    MNLIDataset(
+                        self.data_dir, target_domains, self.domain_dict,
+                        self.sentiment_dict, 'dev_matched', task
+                    ),
+                    MNLIDataset(
+                        self.data_dir, target_domains, self.domain_dict,
+                        self.sentiment_dict, 'dev_mismatched', task
+                    )
+                ])
+                print(f'Domain Classif: stage {stage} | train size {len(self.train)} | valid size {len(self.valid)}')
+
+            elif stage == 'predict':  # Test sets
+                self.predict = ConcatDataset([
+                    MNLIDataset(
+                        self.data_dir, target_domains, self.domain_dict,
+                        self.sentiment_dict, 'test_matched', task, has_labels=False
+                    ),
+                    MNLIDataset(
+                        self.data_dir, target_domains, self.domain_dict,
+                        self.sentiment_dict, 'test_mismatched', task, has_labels=False
+                    )
+                ])
+                print(f'Domain Classif: stage {stage} | predict size {len(self.predict)}')
 
 
     def train_dataloader(self):
@@ -154,6 +185,12 @@ class MNLIDataset(Dataset):
                 if ratio is not None:
                     length = math.floor(len(domain_examples) * ratio)
                     domain_examples = domain_examples[:length]
+
+                if self.task == "domain_classif":
+                    # modify label to domain label here
+                    for example in domain_examples:
+                        example[-1] = domain
+
                 self.examples.extend(domain_examples)
 
         self.length = len(self.examples)
@@ -163,24 +200,25 @@ class MNLIDataset(Dataset):
 
     def __getitem__(self, idx):
         line = self.examples[idx]
+        encoding = self.tokenizer(
+            line[0], line[1],
+            add_special_tokens=True,
+            padding='max_length',
+            max_length=self.tokenizer.model_max_length,
+            truncation=True
+        )
+        item = {
+            'input_ids': encoding['input_ids'],
+            'attention_mask': encoding['attention_mask'],
+            'token_type_ids': encoding['token_type_ids']
+        }
         if self.task == "domain_classif":
-            pass # ... (existing domain classification) ...
+            if self.has_labels and len(line) == 3:
+                item['labels'] = self.domain_dict.get(line[-1], -1)
         else:  # seq_pair_classif
-            encoding = self.tokenizer(
-                line[0], line[1],
-                add_special_tokens=True,
-                padding='max_length',
-                max_length=self.tokenizer.model_max_length,
-                truncation=True
-            )
-            item = {
-                'input_ids': encoding['input_ids'],
-                'attention_mask': encoding['attention_mask'],
-                'token_type_ids': encoding['token_type_ids']
-            }
-            if self.has_labels and len(line) >= 3:
+            if self.has_labels and len(line) == 3:
                 item['labels'] = self.sentiment_dict.get(line[2], -1)
-            return item
+        return item
 
 
 def mnli_preprocess(file_dir, domains):
