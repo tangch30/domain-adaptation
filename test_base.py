@@ -1,6 +1,8 @@
 import lightning as L
 import os, json, datetime
 import torch
+import numpy as np
+from collections import Counter
 from lightning.pytorch.loggers import TensorBoardLogger
 from trainer import LightBERTSeqClass, domain_classif_training, collect_domain_model_paths
 from data_loader import mnli_preprocess, MNLIDataModule, MNLIDataset
@@ -278,7 +280,8 @@ def test_domain_classifier(data_dir, domain, domain_models_dir, logger=None):
     }
     train_params = {
         "batch_size": 16,
-        "num_train_epochs": 1  # Short test run
+        #"num_train_epochs": 1  # Short test run,
+        "num_train_steps": 1,
     }
 
     # Collect domain model paths
@@ -294,12 +297,100 @@ def test_domain_classifier(data_dir, domain, domain_models_dir, logger=None):
         domain_model_paths,
         logger=logger,
         train_ratio=0.01,  # Small subset
-        val_ratio=1.0,
+        val_ratio=0.1,
         grad_accum_steps=1
     )
 
     print(f"Domain classifier test complete | Val Acc: {val_metrics.get('val_acc', 'N/A'):.4f}")
     return val_metrics
+
+
+def test_domain_sampler():
+    domains = ["telephone", "slate", "government"]
+    sentiments = ["entailment", "contradiction", "neutral"]
+    file_dir = r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets'
+
+    # Preprocess data for test domains
+    mnli_preprocess(file_dir, domains)
+
+    # Initialize datamodule
+    dm = MNLIDataModule(file_dir, domains, sentiments)
+    dm.set_sampler_seed(42)  # For reproducibility
+
+    # Set λ distributions for each loader
+    dm.set_sampler_lambda([0.5, 0.3, 0.2], 'train')  # Train sampler
+    dm.set_sampler_lambda([0.3, 0.4, 0.3], 'val')  # Validation sampler
+    dm.set_sampler_lambda([0.2, 0.3, 0.5], 'predict')  # Predict sampler
+
+    # Setup and get dataloaders
+    dm.setup('fit', task='seq_pair_classif', domain='all')
+    train_loader = dm.train_dataloader()
+    val_loader = dm.val_dataloader()
+
+    dm.setup('predict', task='seq_pair_classif', domain='all')
+    predict_loader = dm.predict_dataloader()
+
+    # Function to compute domain distribution
+    def get_domain_distribution(loader, dataset, num_samples=10000):
+        domain_counter = Counter()
+        total = 0
+
+        for batch in loader:
+            if 'indices' in batch:
+                for idx in batch['indices']:
+                    domain_idx = dataset.domain_indices[idx]
+                    domain_counter[domain_idx] += 1
+                total += len(batch['indices'])
+
+            if total >= num_samples:
+                break
+
+        # Normalize to probabilities
+        total = sum(domain_counter.values())
+        return {d: domain_counter[d] / total for d in domain_counter}
+
+    # Verify distributions
+    print("\n=== Verifying Domain Sampling ===")
+    print("Expected distributions:")
+    print(f"Train: {[0.5, 0.3, 0.2]}")
+    print(f"Val:   {[0.3, 0.4, 0.3]}")
+    print(f"Test:  {[0.2, 0.3, 0.5]}")
+
+    # Get actual distributions
+    train_dist = get_domain_distribution(train_loader, dm.train)
+    val_dist = get_domain_distribution(val_loader, dm.valid)
+    predict_dist = get_domain_distribution(predict_loader, dm.predict)
+
+    print("\nActual distributions:")
+    print(f"Train: {[train_dist.get(i, 0) for i in range(len(domains))]}")
+    print(f"Val:   {[val_dist.get(i, 0) for i in range(len(domains))]}")
+    print(f"Test:  {[predict_dist.get(i, 0) for i in range(len(domains))]}")
+
+    # Verify with tolerance
+    TOLERANCE = 0.02  # Allow 2% deviation
+    for i, expected in enumerate([0.5, 0.3, 0.2]):
+        assert abs(train_dist.get(i, 0) - expected) < TOLERANCE, \
+            f"Train domain {i} failed: {train_dist.get(i, 0)} vs {expected}"
+
+    for i, expected in enumerate([0.3, 0.4, 0.3]):
+        assert abs(val_dist.get(i, 0) - expected) < TOLERANCE, \
+            f"Val domain {i} failed: {val_dist.get(i, 0)} vs {expected}"
+
+    for i, expected in enumerate([0.2, 0.3, 0.5]):
+        assert abs(predict_dist.get(i, 0) - expected) < TOLERANCE, \
+            f"Test domain {i} failed: {predict_dist.get(i, 0)} vs {expected}"
+
+    print("\n✅ All domain distributions match within tolerance!")
+
+    # # Additional check: Verify domain indices are consistent
+    # print("\n=== Verifying Domain Indices ===")
+    # for domain_name, domain_idx in dm.domain_dict.items():
+    #     print(f"Domain '{domain_name}' has index {domain_idx}")
+    #
+    #     # Verify all examples in domain have correct index
+    #     domain_indices = []
+    #     for dataset in [dm.train, dm.valid, dm.predict]:
+    #         for i, dom_idx in enumerate
 
 
 if __name__ == '__main__':
@@ -312,38 +403,40 @@ if __name__ == '__main__':
 
     # Add domain classification tests
     # Run domain classifier test
-    data_dir = r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets'
-    domain_models_dir = r'C:\Users\tangc\PycharmProjects\domain-adaptation\logs\domain_models'
-    domain = ["fiction", "telephone", "government", "slate", "travel"]
-    if not domain_models_dir:
-        raise ValueError("--domain_models_dir required for domain_classif task")
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"logs/domain_test_all_domains_{timestamp}"
-    os.makedirs(log_dir, exist_ok=True)
+    # data_dir = r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets'
+    # domain_models_dir = r'C:\Users\tangc\PycharmProjects\domain-adaptation\logs\domain_models'
+    # domains = ["fiction", "telephone", "government", "slate", "travel"]
+    # if not domain_models_dir:
+    #     raise ValueError("--domain_models_dir required for domain_classif task")
+    #
+    # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # log_dir = f"logs/domain_test_all_domains_{timestamp}"
+    # os.makedirs(log_dir, exist_ok=True)
 
     # Minimal logger
-    logger = TensorBoardLogger(
-        save_dir=log_dir,
-        name=domain,
-        version="test_run",
-        default_hp_metric=False
-    )
+    # logger = TensorBoardLogger(
+    #     save_dir=log_dir,
+    #     name="-".join(domains),
+    #     version="test_run",
+    #     default_hp_metric=False
+    # )
+    #
+    # # Run test
+    # results = test_domain_classifier(
+    #     data_dir,
+    #     "-".join(domains),
+    #     domain_models_dir,
+    #     logger=logger
+    # )
+    #
+    # # Save results
+    # with open(os.path.join(log_dir, "test_results.json"), "w") as f:
+    #     json.dump(results, f)
+    #
+    # print(f"Domain classifier test results: {results}")
+    # print(f"Logs saved to: {log_dir}")
 
-    # Run test
-    results = test_domain_classifier(
-        data_dir,
-        domain,
-        domain_models_dir,
-        logger=logger
-    )
-
-    # Save results
-    with open(os.path.join(log_dir, "test_results.json"), "w") as f:
-        json.dump(results, f)
-
-    print(f"Domain classifier test results: {results}")
-    print(f"Logs saved to: {log_dir}")
+    test_domain_sampler()
 
 
 

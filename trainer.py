@@ -12,7 +12,6 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.tensorboard import SummaryWriter
 
 from transformers import AutoConfig, BertForSequenceClassification, AutoModelForSequenceClassification
-from transformers import BertModel
 from transformers.modeling_outputs import SequenceClassifierOutput
 from data_loader import MNLIDataModule, mnli_preprocess
 
@@ -96,6 +95,10 @@ def load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3):
         pretrained_model_name_or_path=pretrained_path,
         num_labels=num_labels
     )
+
+    if ckpt_path is None:
+        return model
+
     checkpoint = torch.load(ckpt_path, map_location='cpu')
     state_dict = checkpoint['state_dict']
 
@@ -119,7 +122,7 @@ def load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3):
 
     # Load filtered state dict
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-    print(f"Successfully loaded keys: {list(new_state_dict.keys())}")
+    #print(f"Successfully loaded keys: {list(new_state_dict.keys())}")
     print(f"Missing keys: {missing}")
     print(f"Unexpected keys: {unexpected}")
     return model
@@ -377,16 +380,20 @@ class LightBERTSeqClass(L.LightningModule):
 
 
 class LightDomainClassifier(L.LightningModule):
-    def __init__(self, domain_model_paths, optimizer_config=None):
+    def __init__(self, domain_model_paths, optimizer_config=None, freeze_domain_models=True):
         super().__init__()
         self.optimizer_config = optimizer_config
         self.mu = optimizer_config["mu"]
+        self.freeze_domain_models = freeze_domain_models
 
         # Load domain-specific BERT models and freeze them
         self.domain_models = torch.nn.ModuleList()
         for path in domain_model_paths:
             model = load_model(path)
-            model.requires_grad_(False)  # Freeze all parameters
+            # Always freeze classifier parameters since we don't use them
+            self._freeze_classifier_parameters(model)
+            if self.freeze_domain_models:
+                model.requires_grad_(False)  # Freeze all parameters
             self.domain_models.append(model)
 
         # Get hidden size from first model
@@ -396,25 +403,50 @@ class LightDomainClassifier(L.LightningModule):
         self.w = torch.nn.Parameter(torch.randn(hidden_size))
 
 
+    def _freeze_classifier_parameters(self, model):
+        """Freeze classifier parameters since they're not used in domain classification"""
+        classifier_layers = [
+            'classifier', 'cls', 'fc', 'out_proj', 'qa_outputs'
+        ]
+
+        for name, param in model.named_parameters():
+            if any(layer in name for layer in classifier_layers):
+                param.requires_grad = False
+                print(f"Freezing classifier layer: {name}")
+
+
     def forward(self, batch, return_dict=True):
         # Collect features from all domain-specific models
         domain_features = []
-        inputs = {
-            'input_ids': batch['input_ids'],
-            'attention_mask': batch['attention_mask'],
-            'token_type_ids': batch['token_type_ids'],
-            'return_dict': return_dict
-        }
         for model in self.domain_models:
-            # TODO: model.bert may not be compatible with all models
-            outputs = model.bert(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                token_type_ids=inputs["token_type_ids"],
-                return_dict=True
-            )
-            # Use pooled output (CLS token representation)
-            pooled_output = outputs.pooler_output
+            # Use checkpointing only for unfrozen models
+            if not self.freeze_domain_models:
+                pooled_output = torch.utils.checkpoint.checkpoint(
+                    self._forward_model,
+                    model,
+                    batch['input_ids'],
+                    batch['attention_mask'],
+                    batch['token_type_ids'],
+                    use_reentrant=False,
+                )
+                # outputs = model.bert(
+                #     input_ids=batch['input_ids'],
+                #     attention_mask=batch['attention_mask'],
+                #     token_type_ids=batch['token_type_ids'],
+                #     return_dict=True
+                # )
+                # pooled_output = outputs.pooler_output
+
+            else:
+                # For frozen models or during eval
+                with torch.set_grad_enabled(False):
+                    outputs = model.bert(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch['attention_mask'],
+                        token_type_ids=batch['token_type_ids'],
+                        return_dict=True
+                    )
+                    pooled_output = outputs.pooler_output
             domain_features.append(pooled_output)
 
         # Stack features: (batch_size, num_domains, hidden_size)
@@ -423,6 +455,18 @@ class LightDomainClassifier(L.LightningModule):
         # Compute logits: w^T * f(x, k) for each domain k
         logits = torch.einsum('h,bkh->bk', self.w, features)
         return logits
+
+
+    def _forward_model(self, model, input_ids, attention_mask, token_type_ids):
+        """Helper function for gradient checkpointing"""
+        outputs = model.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True
+        )
+        return outputs.pooler_output
+
 
     def training_step(self, batch, batch_idx):
         logits = self(batch)
@@ -435,7 +479,37 @@ class LightDomainClassifier(L.LightningModule):
 
         total_loss = loss + reg_loss
         self.log("train_loss", total_loss, prog_bar=True)
+
         return total_loss
+
+    # def on_after_backward(self):
+    #     """CORRECT place to check gradients"""
+    #     print("\n=== GRADIENT ANALYSIS ===")
+    #     if self.global_step >= 5:
+    #         return
+    #     # 1. Check w gradients
+    #     if self.w.grad is None:
+    #         print("❌ w.grad is None")
+    #     else:
+    #         w_norm = self.w.grad.norm().item()
+    #         print(f"✅ w.grad exists | norm: {w_norm}")
+    #         self.log("grad_norm/w", w_norm, prog_bar=True)
+    #
+    #     # 2. Check domain model gradients
+    #     for i, model in enumerate(self.domain_models):
+    #         total_norm = 0
+    #         total_params = 0
+    #         grad_params = 0
+    #
+    #         for name, param in model.named_parameters():
+    #             total_params += 1
+    #             if param.grad is not None:
+    #                 grad_params += 1
+    #                 total_norm += param.grad.norm().item() ** 2
+    #
+    #         total_norm = total_norm ** 0.5 if grad_params > 0 else 0
+    #         print(f"Domain {i} | Grad params: {grad_params}/{total_params} | Norm: {total_norm:.6f}")
+    #         self.log(f"grad_norm/domain_{i}", total_norm, prog_bar=True)
 
 
     def validation_step(self, batch, batch_idx):
@@ -453,14 +527,22 @@ class LightDomainClassifier(L.LightningModule):
 
 
     def configure_optimizers(self):
+        #params = [self.w]
+        #for model in self.domain_models:
+        #    params += list(model.parameters())
+        trainable_params = [self.w]
+        if not self.freeze_domain_models:
+            for model in self.domain_models:
+                trainable_params += [p for p in model.parameters() if p.requires_grad]
+
+        lr = self.optimizer_config.get('lr', 2e-5)
         optimizer = torch.optim.AdamW(
-            [self.w],
+            trainable_params,
             #lr=lr,
-            weight_decay=0.01,
+            weight_decay=0,
             eps=1e-6,
         )
 
-        lr = self.optimizer_config.get('lr', 2e-5)
         total_steps = self.optimizer_config.get('total_steps', None)
         epochs = self.optimizer_config.get("epochs", None)
         warmup_ratio = self.optimizer_config.get('warmup_ratio', 0.01)
@@ -473,7 +555,6 @@ class LightDomainClassifier(L.LightningModule):
 
         assert total_steps is not None, "Total number of steps cannot be determined!"
 
-        assert total_steps is not None
         print(f"Total train steps: {total_steps}")
 
         steps_per_epoch = None
@@ -621,7 +702,7 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
 
 def domain_classif_training(data_dir, domains, optimizer_config, train_params,
                             domain_model_paths, logger=None, train_ratio=0.05,
-                            val_ratio=0.3, grad_accum_steps=1):
+                            val_ratio=0.3, grad_accum_steps=1, freeze_domain_models=True):
     """
     TODO: test code sanity and tuner
     Train a domain classifier using pre-trained domain-specific models
@@ -636,7 +717,8 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
     # Create domain classifier model
     domain_classifier = LightDomainClassifier(
         domain_model_paths=domain_model_paths,
-        optimizer_config=optimizer_config
+        optimizer_config=optimizer_config,
+        freeze_domain_models=freeze_domain_models
     )
 
     # Setup data module for domain classification
@@ -672,7 +754,8 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
             limit_val_batches=val_ratio,
             max_steps=max_steps,
             enable_progress_bar=True,
-            log_every_n_steps=20,  # TODO
+            log_every_n_steps=10,  # TODO: set values back to original
+            val_check_interval=50,
             callbacks=[checkpoint_callback]
             # callbacks=[L.pytorch.callbacks.ModelCheckpoint(monitor='val_acc', mode='max')]
         )
@@ -688,6 +771,7 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
             max_epochs=max_epochs,
             enable_progress_bar=True,
             log_every_n_steps=100,
+            val_check_interval=100,
             callbacks=[checkpoint_callback]
         )
 
@@ -730,6 +814,10 @@ if __name__ == '__main__':
                         default=r'C:\Users\tangc\PycharmProjects\domain-adaptation\datasets')
     parser.add_argument("--domain_models_dir", type=str, default=None,
                         help="Directory containing trained domain-specific models")
+    #TODO: beta
+    parser.add_argument("--single_bert_path", type=str, default=None,
+                        help="Path to a single pre-trained BERT model to be used as k copies for k domains")
+    parser.add_argument("--unfreeze_domain_models", action="store_false", default=True)
     parser.add_argument("--ckpt_path", type=str, default=None,
                         help="Path to checkpoint directory")
     parser.add_argument("--freeze_mode", type=str, default=None,
@@ -800,8 +888,16 @@ if __name__ == '__main__':
 
     else:
         # get all model address from given folder
-        # TODO： add tests
-        domain_model_paths = collect_domain_model_paths(domain, args.domain_models_dir)
+        # TODO： beta
+        if args.single_bert_path:
+            # Create k copies of the same model path
+            domain_model_paths = [args.single_bert_path] * len(domain)
+            print(f"Using single BERT model at {args.single_bert_path} for all {len(domain)} domains")
+        else:
+            # Original behavior - collect domain-specific models
+            domain_model_paths = collect_domain_model_paths(domain, args.domain_models_dir)
+            print(f"Using domain-specific models: {domain_model_paths}")
+
         val_metrics = domain_classif_training(
             data_dir,
             domain,
@@ -811,7 +907,8 @@ if __name__ == '__main__':
             logger=logger,
             train_ratio=args.train_ratio,
             val_ratio=1.0,
-            grad_accum_steps=args.grad_accum_steps
+            grad_accum_steps=args.grad_accum_steps,
+            freeze_domain_models=args.unfreeze_domain_models,
         )
 
 

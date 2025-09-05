@@ -162,17 +162,19 @@ if __name__ == '__main__':
                         help="Task to tune")
     parser.add_argument("--domain_models_dir", type=str,  # New argument
                         help="Directory with domain models (required for domain_classif)")
+    parser.add_argument("--single_bert_path", action="store_true", default=False,
+                        help="Whether a single pre-trained BERT model to be used as k copies for k domains")
     args = parser.parse_args()
 
     if args.task == "domain_classif":
         # Define search space for domain classifier hyperparameters
         search_space = {
-            "lr": [1e-3, 1e-4, 1e-5, 1e-6],  # Learning rate for domain classifier
+            "lr": [1e-5],  # Learning rate for domain classifier
             "mu": [0.0],  # Regularization strength
-            "grad_accum_steps": [2],
-            "batch_size": [16],
+            "grad_accum_steps": [16],
+            "batch_size": [2],
             "num_train_steps": [500],
-            "train_ratio": [0.05, 0.2]
+            "train_ratio": [0.05, 0.2, 1.0]
         }
 
         # Generate all combinations of hyperparameters
@@ -204,9 +206,13 @@ if __name__ == '__main__':
 
                 # Collect domain model paths
                 domains = args.domain.split("-")
-                domain_model_paths = collect_domain_model_paths(
+                if args.domain_models_dir is not None:
+                    domain_model_paths = collect_domain_model_paths(
                     domains, args.domain_models_dir
-                )
+                    )
+                elif args.single_bert_path:
+                    domain_model_paths = [None] * len(domains)
+                    print(f"Using single pretrained BERT model for all {len(domains)} domains")
 
                 optimizer_config = {
                     "lr": config["lr"],
@@ -231,7 +237,8 @@ if __name__ == '__main__':
                     domain_model_paths=domain_model_paths,
                     logger=logger,
                     train_ratio=config["train_ratio"],
-                    grad_accum_steps=config["grad_accum_steps"]
+                    grad_accum_steps=config["grad_accum_steps"],
+                    freeze_domain_models=False,
                 )
 
                 # Record results
