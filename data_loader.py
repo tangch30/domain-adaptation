@@ -5,6 +5,9 @@ import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, Sampler
 from transformers import AutoTokenizer
 
+# partly coded by DeepSeek
+
+#TODO: train with DomainSampler (multiple epochs), val_size (?)
 
 def input_handler(batch, device='cuda'):
     batch_x = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
@@ -39,10 +42,10 @@ def collate_fn(batch):
 
 
 class DomainSampler(Sampler):
-    def __init__(self, dataset, domain_probs, epoch_length=None, seed=None):
+    def __init__(self, dataset, domain_probs, max_samples=None, seed=None):
         self.dataset = dataset
         self.domain_probs = domain_probs
-        self.epoch_length = epoch_length if epoch_length is not None else len(dataset)
+        self.epoch_length = max_samples if max_samples is not None else len(dataset)
         self.seed = seed
 
         # Group indices by domain
@@ -100,7 +103,6 @@ class MNLIDataModule(pl.LightningDataModule):
         self.batch_size = 1
         self.stage = None
         self.task = None
-        self.sampler_seed = None
 
         # Initialize lambda attributes
         self.train_sampler_lambda = None
@@ -109,12 +111,8 @@ class MNLIDataModule(pl.LightningDataModule):
 
         self.val_size = val_size
 
-    def set_sampler_seed(self, seed):
-        """Set seed for reproducible sampling"""
-        self.sampler_seed = seed
 
-
-    def set_sampler_lambda(self, lambda_vector, loader_type='train', size=None):
+    def set_sampler_config(self, lambda_vector, loader_type='train', size=None):
         if loader_type == 'train':
             self.train_sampler_lambda = lambda_vector
         elif loader_type == 'val':
@@ -127,86 +125,61 @@ class MNLIDataModule(pl.LightningDataModule):
         else:
             raise ValueError("loader_type must be 'train', 'val', or 'predict'")
 
-
     def reset_batch_size(self, batch_size):
         self.batch_size = batch_size
 
     def set_predict_suffix(self, suffix):
         """Set the suffix for prediction data (e.g., '.test_matched')"""
+        # TODO: What is this ?
         self.predict_suffix = suffix
 
     def prepare_data(self):
         mnli_preprocess(self.data_dir, self.domains)
 
-    def setup(self, stage, task='seq_pair_classif', domain=None, ratio=None):
+    def setup(self, stage, task='seq_pair_classif', domain=None):
         self.stage = stage
         self.task = task
-        target_domains = self.domains if domain == "all" else [domain]
+        assert domain is not None, "Please provide a domain(s)"
+        target_domains = self.domains if domain == "all" else domain.split("-")
         print(f'Setup datasets, target domains: {target_domains}')
-        if task == 'seq_pair_classif':
-            if stage == 'fit':  # Training + Validation
-                # Entire training set
-                self.train = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, 'train', task
-                )
-                # Validation set (currently only dev_matched)
-                self.valid = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, ['dev_matched'], task
-                )
-                print(f'Setup stage {stage} | train size {len(self.train)} | validation size {len(self.valid)}')
+        if stage == 'fit':  # Training + Validation
+            # Entire training set
+            self.train = MNLIDataset(
+                self.data_dir, target_domains, self.domain_dict,
+                self.sentiment_dict, 'train', task
+            )
+            # Validation set (currently only dev_matched)
+            self.valid = MNLIDataset(
+                self.data_dir, target_domains, self.domain_dict,
+                self.sentiment_dict, ['dev_matched'], task
+            )
+            print(f'Task {task} | Setup stage {stage} | train size {len(self.train)} | validation size {len(self.valid)}')
 
-            elif stage == 'predict':  # Unlabeled data
-                self.predict = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, ['test_matched'], task, has_labels=False
-                )
-                print(f'Setup stage {stage} | predict size {len(self.predict)}')
-
-
-        elif task == 'domain_classif':
-            # Combine data from all domains
-            if stage == 'fit':  # Training + Validation
-                # Training set combines all domains
-                self.train = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, 'train', task
-                )
-                # Validation set combines dev splits
-                self.valid = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, ['dev_matched'], task
-                )
-                print(f'Domain Classif: stage {stage} | train size {len(self.train)} | valid size {len(self.valid)}')
-
-            elif stage == 'predict':  # Test sets
-                self.predict = MNLIDataset(
-                    self.data_dir, target_domains, self.domain_dict,
-                    self.sentiment_dict, ['test_matched'], task, has_labels=False
-                )
-                print(f'Domain Classif: stage {stage} | predict size {len(self.predict)}')
+        elif stage == 'predict':  # Unlabeled data
+            self.predict = MNLIDataset(
+                self.data_dir, target_domains, self.domain_dict,
+                self.sentiment_dict, ['test_matched'], task, has_labels=False
+            )
+            print(f'Task {task} | Setup stage {stage} | predict size {len(self.predict)}')
 
 
-    def _create_dataloader(self, dataset, sampler_lambda, is_training=False):
+    def _create_dataloader(self, dataset, sampler_lambda, is_training=False, seed=None, max_samples=None):
         if sampler_lambda is not None:
-            # Validate lambda length matches number of target domains
-            if len(sampler_lambda) != len(self.domains):
-                raise ValueError(f"lambda length ({len(sampler_lambda)}) must match number of domains ({len(self.domains)})")
+            # Validate lambda length matches number of processed domains in dataset
+            if len(sampler_lambda) != len(dataset.domains):
+                raise ValueError(f"lambda length ({len(sampler_lambda)}) must match number of domains ({len(dataset.domains)}) in dataset")
 
-            epoch_length = self.val_size if not is_training else None
             sampler = DomainSampler(
                 dataset,
                 sampler_lambda,
-                epoch_length=epoch_length,
-                seed=self.sampler_seed
+                max_samples=max_samples,
+                seed=seed
             )
             return DataLoader(
                 dataset,
                 batch_size=self.batch_size,
                 sampler=sampler,
-                collate_fn=collate_fn,
-                #generator=torch.Generator().manual_seed(self.sampler_seed) if self.sampler_seed else None
+                collate_fn=collate_fn
             )
         else:
             return DataLoader(
@@ -214,17 +187,19 @@ class MNLIDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size,
                 collate_fn=collate_fn,
                 shuffle=is_training,
-                generator=torch.Generator().manual_seed(self.sampler_seed) if self.sampler_seed else None
+                generator=torch.Generator().manual_seed(seed) if seed is not None else None
             )
 
 
     # Then in the specific dataloader methods:
-    def train_dataloader(self):
+    def train_dataloader(self, seed=None, max_samples=None):
         assert self.stage == 'fit'
         return self._create_dataloader(
             self.train,
             self.train_sampler_lambda,
-            is_training=True
+            is_training=True,
+            seed=seed,
+            max_samples=max_samples
         )
 
     def val_dataloader(self):
@@ -243,7 +218,6 @@ class MNLIDataModule(pl.LightningDataModule):
             is_training=False
         )
 
-
     def get_dataloader(self, domain, loader_type='train', is_training=False):
         """
         Get DataLoader for a specific domain or all domains (if domain == 'all') and loader type ('train', 'val', or 'predict').
@@ -257,8 +231,8 @@ class MNLIDataModule(pl.LightningDataModule):
         """
         assert loader_type in ['train', 'val', 'predict'], "loader_type must be 'train', 'val', or 'predict'"
 
-        # Determine target domains based on the 'domain' argument
-        target_domains = self.domains if domain == 'all' else [domain]
+        # Determine target domains based on the 'domain' argument (could be a subset of available domains)
+        target_domains = self.domains if domain == 'all' else domain.split("-")
 
         # Print which domains are being loaded
         print(f'Loading datasets for target domains: {target_domains}')
@@ -300,7 +274,7 @@ class MNLIDataset(Dataset):
         self.tokenizer = AutoTokenizer.from_pretrained(
             r'C:\Users\tangc\PycharmProjects\domain-adaptation\bert-base-uncased-cache'
         )
-        self.suffixes = [suffixes] if isinstance(suffixes, str) else suffixes
+        self.suffixes = [suffixes] if isinstance(suffixes, str) else suffixes #TODO
         self.task = task
         self.domain_dict = domain_dict
         self.sentiment_dict = sentiment_dict
@@ -309,7 +283,7 @@ class MNLIDataset(Dataset):
         self.domain_indices = []  # Store local domain indices
         self.length = 0
 
-        # Create local domain mapping for the current target domains
+        # Create local domain mapping for the current target domains in this dataset instance
         self.local_domain_dict = {d: idx for idx, d in enumerate(self.domains)}
 
         for domain in self.domains:
@@ -326,9 +300,11 @@ class MNLIDataset(Dataset):
 
                     if self.task == "domain_classif":
                         # modify label to domain label here
-                        for example in domain_examples:
-                            if len(example) == 3:  # Only if label exists
-                                example[-1] = domain
+                        domain_examples_new = list()
+                        for idx, example in enumerate(domain_examples):
+                            new_example = (example[0], example[1], domain)
+                            domain_examples_new.append(new_example)
+                        domain_examples = domain_examples_new
 
                     # Add examples and their local domain indices
                     local_domain_idx = self.local_domain_dict[domain]
@@ -364,7 +340,7 @@ class MNLIDataset(Dataset):
             "idx": idx
         }
         if self.task == "domain_classif":
-            if self.has_labels and label is not None:
+            if label is not None:
                 item['labels'] = self.domain_dict.get(label, -1)
         else:  # seq_pair_classif
             if self.has_labels and label is not None:
@@ -407,7 +383,7 @@ def mnli_preprocess(file_dir, domains):
                 continue
             ex = data.strip().split('\t')
             if ex[3] == domain:
-                train_examples.append((ex[-4], ex[-3], ex[-1]))
+                train_examples.append((ex[-4], ex[-3], ex[-1])) # Sentence A, Sentence B, label
 
         with open(os.path.join(file_dir, f"{domain}.train.tmp"), "w") as f:
             json.dump({"domain": domain, "data": train_examples}, f)
@@ -439,6 +415,7 @@ def mnli_preprocess(file_dir, domains):
                     test_examples.append((ex[-2], ex[-1]))
 
             with open(os.path.join(file_dir, f"{domain}.{suffix}.tmp"), "w") as f:
+                # store labeled data by domain
                 json.dump({"domain": domain, "data": test_examples}, f)
 
 
@@ -504,8 +481,6 @@ if __name__ == '__main__':
     # Initialize datamodule
     domains = ["telephone", "slate", "government", "fiction", "travel"]
     dm = MNLIDataModule(file_dir, domains, sentiments)
-    # Set seed for reproducibility
-    dm.set_sampler_seed(42)
 
     # First run
     dm.setup('fit', domain="all")
