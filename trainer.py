@@ -5,6 +5,7 @@ import lightning as L
 import torch
 import argparse, os, json
 import torch.nn.functional as F
+import numpy as np
 from datetime import datetime
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -65,28 +66,6 @@ def collect_domain_model_paths(domains, domain_models_dir):
         print(f"  {domain}: {path}")
 
     return domain_model_paths
-
-
-# def load_model(ckpt_path, pretrained_path=BERT_BASE_DIR, num_labels=3):
-#     model = AutoModelForSequenceClassification.from_pretrained(
-#         pretrained_model_name_or_path=pretrained_path,
-#         num_labels=num_labels
-#     )
-#     # Load checkpoint
-#     checkpoint = torch.load(ckpt_path, map_location='cpu')
-#     # Extract state dict
-#     state_dict = checkpoint['state_dict']
-#     for key in state_dict.keys():
-#         print(key)
-#     state_dict = {k.replace('model.', ''): v
-#                   for k, v in state_dict.items()
-#                   if k.startswith('model.')
-#                   }
-#
-#     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-#     print(f"Missing keys: {missing}")
-#     print(f"Unexpected keys: {unexpected}")
-#     return model
 
 
 # Update the load_model function to handle different checkpoint formats
@@ -436,7 +415,6 @@ class LightDomainClassifier(L.LightningModule):
                 #     return_dict=True
                 # )
                 # pooled_output = outputs.pooler_output
-
             else:
                 # For frozen models or during eval
                 with torch.set_grad_enabled(False):
@@ -482,35 +460,6 @@ class LightDomainClassifier(L.LightningModule):
 
         return total_loss
 
-    # def on_after_backward(self):
-    #     """CORRECT place to check gradients"""
-    #     print("\n=== GRADIENT ANALYSIS ===")
-    #     if self.global_step >= 5:
-    #         return
-    #     # 1. Check w gradients
-    #     if self.w.grad is None:
-    #         print("❌ w.grad is None")
-    #     else:
-    #         w_norm = self.w.grad.norm().item()
-    #         print(f"✅ w.grad exists | norm: {w_norm}")
-    #         self.log("grad_norm/w", w_norm, prog_bar=True)
-    #
-    #     # 2. Check domain model gradients
-    #     for i, model in enumerate(self.domain_models):
-    #         total_norm = 0
-    #         total_params = 0
-    #         grad_params = 0
-    #
-    #         for name, param in model.named_parameters():
-    #             total_params += 1
-    #             if param.grad is not None:
-    #                 grad_params += 1
-    #                 total_norm += param.grad.norm().item() ** 2
-    #
-    #         total_norm = total_norm ** 0.5 if grad_params > 0 else 0
-    #         print(f"Domain {i} | Grad params: {grad_params}/{total_params} | Norm: {total_norm:.6f}")
-    #         self.log(f"grad_norm/domain_{i}", total_norm, prog_bar=True)
-
 
     def validation_step(self, batch, batch_idx):
         logits = self(batch)
@@ -553,6 +502,7 @@ class LightDomainClassifier(L.LightningModule):
             #TODO: need extra debugging
             total_steps = self.trainer.estimated_stepping_batches
 
+
         assert total_steps is not None, "Total number of steps cannot be determined!"
 
         print(f"Total train steps: {total_steps}")
@@ -563,6 +513,11 @@ class LightDomainClassifier(L.LightningModule):
             steps_per_epoch = total_steps // epochs
 
         print(f"Epochs {epochs} | Steps per epoch {steps_per_epoch}")
+
+        print(
+            f"[DEBUG] About to init OneCycleLR with "
+            f"total_steps={total_steps}, epochs={epochs}, steps_per_epoch={steps_per_epoch}, warmup_ratio={warmup_ratio}"
+        )
 
         if steps_per_epoch is not None:
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -702,7 +657,8 @@ def seq_pair_classif_training(data_dir, domains, optimizer_config, train_params,
 
 def domain_classif_training(data_dir, domains, optimizer_config, train_params,
                             domain_model_paths, logger=None, train_ratio=0.05,
-                            val_ratio=0.3, grad_accum_steps=1, freeze_domain_models=True):
+                            val_ratio=0.3, grad_accum_steps=1,
+                            freeze_domain_models=True, max_samples=None):
     """
     TODO: test code sanity and tuner
     Train a domain classifier using pre-trained domain-specific models
@@ -726,6 +682,8 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
     dm.prepare_data()
     dm.reset_batch_size(batch_size)
     dm.setup('fit', 'domain_classif', "all")  # Use all domains for domain classification
+    k = len(domains)
+    dm.set_sampler_config(np.ones(k)/k, loader_type='train')
 
     # Create checkpoint directory
     checkpoint_dir = os.path.join(logger.log_dir, "checkpoints") if logger else "checkpoints"
@@ -746,7 +704,8 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
     if max_epochs == -1:
 
         trainer = L.Trainer(
-            accelerator="auto",
+            accelerator="gpu",
+            precision="16-mixed",
             logger=logger,
             gradient_clip_val=1.0,
             accumulate_grad_batches=grad_accum_steps,
@@ -755,7 +714,7 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
             max_steps=max_steps,
             enable_progress_bar=True,
             log_every_n_steps=10,  # TODO: set values back to original
-            val_check_interval=50,
+            val_check_interval=200,
             callbacks=[checkpoint_callback]
             # callbacks=[L.pytorch.callbacks.ModelCheckpoint(monitor='val_acc', mode='max')]
         )
@@ -792,7 +751,7 @@ def domain_classif_training(data_dir, domains, optimizer_config, train_params,
     print("Labels:", sample_batch['labels'][:10])
 
     # Train the model
-    trainer.fit(domain_classifier, dm.train_dataloader(), dm.val_dataloader())
+    trainer.fit(domain_classifier, dm.train_dataloader(seed=42, max_samples=max_samples), dm.val_dataloader())
 
     # Return final validation metrics
     val_metrics = trainer.validate(domain_classifier, dataloaders=dm.val_dataloader())
@@ -931,3 +890,4 @@ if __name__ == '__main__':
         json.dump(result, f)
 
     print(val_metrics)
+

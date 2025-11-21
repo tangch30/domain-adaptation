@@ -4,8 +4,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import cvxpy as cp
-from eval_utils import STATBuilder, _to_inputs
 from tqdm import tqdm
+from eval_utils import STATBuilder, _to_inputs, TorchBaseWrapper, SklearnBaseWrapper, TorchBetaWrapper, SklearnBetaWrapper
 
 EPS = 1e-12
 
@@ -13,20 +13,30 @@ EPS = 1e-12
 # Convergence criteria should be considered
 
 
+# @torch.no_grad()
+# def _trueclass_probs(models, inputs, labels, device="cuda"):
+#     B = labels.size(0)
+#     cols = []
+#     for m in models:
+#         m.to(device)  # move current model to GPU
+#         out = m(**inputs)  # safe: model and inputs both on GPU
+#         m.to("cpu")  # free GPU
+#         torch.cuda.empty_cache()
+#         #out = m(**inputs)
+#         p = F.softmax(out.logits, dim=-1)  # [B, C]
+#         cols.append(p[torch.arange(B, device=p.device), labels.to(p.device)])
+#     return torch.stack(cols, dim=1)  # [B, K]
+
+
 @torch.no_grad()
-def _trueclass_probs(models, inputs, labels, device="cuda"):
+def _trueclass_probs(wrapped_models, inputs, labels, device="cuda"):
+    # this is for cross-entropy evaluation
     B = labels.size(0)
     cols = []
-    for m in models:
-        m.to(device)  # move current model to GPU
-        out = m(**inputs)  # safe: model and inputs both on GPU
-        m.to("cpu")  # free GPU
-        torch.cuda.empty_cache()
-        #out = m(**inputs)
-        p = F.softmax(out.logits, dim=-1)  # [B, C]
+    for model in wrapped_models:
+        p = model.predict_proba(inputs)  # [B, C]
         cols.append(p[torch.arange(B, device=p.device), labels.to(p.device)])
     return torch.stack(cols, dim=1)  # [B, K]
-
 
 
 class DCBuilder:
@@ -40,15 +50,27 @@ class DCBuilder:
       u_k(z) as cvxpy expressions,
       v_k(z_t) and grad v_k(z_t) in closed form.
     """
-
-    def __init__(self, base_models, beta_func, device="cuda"):
-        self.base_models = base_models
-        self.beta_func = beta_func
+    def __init__(self, base_models, beta_func, device="cuda", input_key='features'):
         self.device = device
+        self.input_key = input_key
+
+        # Wrap base models
+        self.base_models = []
+        for model in base_models:
+            if isinstance(model, torch.nn.Module):
+                self.base_models.append(TorchBaseWrapper(model, device))
+            else:
+                self.base_models.append(SklearnBaseWrapper(model, input_key, device))
+
+        # Wrap beta function
+        if isinstance(beta_func, torch.nn.Module):
+            self.beta_func = TorchBetaWrapper(beta_func, device)
+        else:
+            self.beta_func = SklearnBetaWrapper(beta_func, input_key, device)
+
         self.A_by_dom = []
         self.B_by_dom = []
-        for model in self.base_models:
-            model.eval().to(device)
+
 
     @torch.no_grad()
     def precompute_AB(self, domain_loaders, domains, max_batches=None):
@@ -232,9 +254,8 @@ def run_dc(domains, datamodule, base_models, beta_func,
     for t in range(num_iters):
         zs.append(z_t)
         print(f"Iteration {t + 1}/{num_iters}, z_t {z_t}")
-        # --- NEW: ensure beta_func uses the current z_t ---
-        if hasattr(beta_func, "set_z"):
-            beta_func.set_z(torch.tensor(z_t, dtype=torch.float32, device=device))
+        assert hasattr(beta_func, "set_z"), "This is not a valid beta function"
+        beta_func.set_z(torch.tensor(z_t, dtype=torch.float32, device=device))
 
         dcb.precompute_AB(loaders, domains, max_batches=max_batches)  # (optional: pass max_batches if supported)
 

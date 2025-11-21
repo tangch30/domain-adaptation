@@ -1,6 +1,7 @@
 import os, datetime, json
 import argparse
 import pandas as pd
+import traceback
 import itertools
 import torch
 import lightning as L
@@ -169,12 +170,12 @@ if __name__ == '__main__':
     if args.task == "domain_classif":
         # Define search space for domain classifier hyperparameters
         search_space = {
-            "lr": [1e-5],  # Learning rate for domain classifier
-            "mu": [0.0],  # Regularization strength
+            "lr": [3e-5, 1e-4],  # Learning rate for domain classifier
+            "mu": [0.0, 0.1],  # Regularization strength
             "grad_accum_steps": [16],
             "batch_size": [2],
-            "num_train_steps": [500],
-            "train_ratio": [0.05, 0.2, 1.0]
+            "num_train_steps": [150],
+            "train_ratio": [0.05]
         }
 
         # Generate all combinations of hyperparameters
@@ -239,6 +240,7 @@ if __name__ == '__main__':
                     train_ratio=config["train_ratio"],
                     grad_accum_steps=config["grad_accum_steps"],
                     freeze_domain_models=False,
+                    max_samples=None,
                 )
 
                 # Record results
@@ -255,12 +257,16 @@ if __name__ == '__main__':
                 print(f"Trial complete | Val Acc: {val_metrics.get('val_acc', 'N/A'):.4f}")
 
             except Exception as e:
-                print(f"Trial failed: {str(e)}")
+                tb_str = traceback.format_exc()
+                print(f"Trial failed: {repr(e)}\n{tb_str}")
                 results.append({
                     "trial": i + 1,
                     "error": str(e),
+                    "traceback": tb_str,
                     **config
                 })
+
+            torch.cuda.empty_cache()
 
         # Find best configuration
         successful_runs = [r for r in results if 'val_acc' in r]
